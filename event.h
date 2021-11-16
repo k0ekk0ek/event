@@ -9,50 +9,9 @@
  *
  * SPDX-License-Identifier: EPL-2.0 OR BSD-3-Clause
  */
+#include <stdint.h>
 
-// prototype implementation for Microsoft Windows
-//
-// Windows offers three (four?) flavours of event handling mechanisms.
-//  1. select (or WSAPoll)
-//  2. WSAWaitForMultipleEvents (WaitForMultipleObjects)
-//  3. I/O Completion Ports
-//  4. Windows Registered I/O
-//
-// select is notoriously slow on Windows, which is not a big problem if used
-// for two udp sockets (discovery+data), but is a problem if tcp connections
-// are used. WSAPoll is broken (1) up to Windows 10 version 2004 (2), which was
-// released in May of 2020. WSAWaitForMultipleEvents is more performant, which
-// is why it is used for Windows CE already, but only allows for
-// WSA_MAXIMUM_WAIT_EVENTS (MAXIMUM_WAIT_OBJECTS, or 64) sockets to be polled
-// simultaneously, which again may be a problem if tcp connections are used.
-// select is also limited to 64 sockets unless FD_SETSIZE is defined to a
-// higher number before including winsock2.h (3). For high-performance I/O
-// on Windows, OVERLAPPED sockets in combination with I/O Completion Ports is
-// recommended, but the interface is completely different from interfaces like
-// epoll and kqueue (4). Zero byte receives can of course be used (5,6,7), but
-// it seems suboptimal to do so(?) Asynchronous I/O, which is offered by the
-// likes of I/O Completion Ports and io_uring, seems worthwile, but the
-// changes seem a bit to substantial at this point.
-//
-// OPTION #5: wepoll, epoll for windows (8)
-//
-// wepoll implements the epoll API for Windows using the Ancillart Function
-// Driver, i.e. Winsock. wepoll was developed by one of the libuv authors (9)
-// and is used by libevent (10,11) and ZeroMQ (12).
-//
-// 1: https://daniel.haxx.se/blog/2012/10/10/wsapoll-is-broken/
-// 2: https://docs.microsoft.com/en-us/windows/win32/api/winsock2/nf-winsock2-wsapoll
-// 3: https://docs.microsoft.com/en-us/windows/win32/winsock/maximum-number-of-sockets-supported-2
-// 4: https://sudonull.com/post/14582-epoll-and-Windows-IO-Completion-Ports-The-Practical-Difference
-// 5: https://stackoverflow.com/questions/49970454/zero-byte-receives-purpose-clarification
-// 6: https://stackoverflow.com/questions/10635976/iocp-notifications-without-bytes-copy
-// 7: https://stackoverflow.com/questions/24434289/select-equivalence-in-i-o-completion-ports
-// 8: https://github.com/piscisaureus/wepoll
-// 9: https://news.ycombinator.com/item?id=15978372
-// 10: https://github.com/libevent/libevent/pull/1006
-// 11: https://libev.schmorp.narkive.com/tXCCS0na/better-windows-backend-using-wepoll
-// 12: https://github.com/zeromq/libzmq/pull/3127
-
+#if _WIN32
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
@@ -60,7 +19,16 @@
 #include <windows.h>
 #include <winsock2.h>
 #include <ws2tcpip.h>
-#include <stdint.h>
+#include <iphlpapi.h>
+
+typedef SOCKET socket_t;
+#elif __APPLE__
+#include <sys/event.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+
+typedef int socket_t;
+#endif
 
 #define READ (1u<<0)
 #define WRITE (1u<<1)
@@ -90,8 +58,6 @@ struct event {
 
 void destroy_event(void *);
 
-typedef SOCKET socket_t;
-
 typedef struct socket_event socket_event_t;
 typedef int32_t(*socket_callback_t)(const socket_event_t *, uint32_t, void *);
 struct socket_event {
@@ -109,9 +75,24 @@ typedef struct ipchange_event ipchange_event_t;
 struct ipchange_event;
 typedef int32_t(*ipchange_callback_t)(const ipchange_event_t *, ipchange_message_t *, uint32_t, void *);
 
+/* an abstract notion of an interface identifier is required because of
+   differences between operating systems. previously the interface name was
+   used, but that caused problems on (at least) Windows because the name
+   cannot be retreived if the interface is down. of course, getifaddrs must
+   be updated to provide the same information */
+typedef struct interface interface_t;
+struct interface {
+#if _WIN32
+  NET_LUID luid;
+  NET_IFINDEX index;
+#elif __APPLE__
+  uint32_t unit;
+#endif
+};
+
 struct ipchange_message {
-  const char *interface; /**< interface name (NULL if interface is removed?) */
-  const SOCKADDR *address; /**< socket address (on EV_IPV(4|6)_(ADD|DELETE), not EV_LINK_(UP|DOWN)) */
+  const interface_t *interface;
+  const struct sockaddr *socket_address; /**< socket address (if applicable) */
 };
 
 /* requires use of NotifyIpInterfaceChange and NotifyUnicastIpAddressChange.
@@ -120,9 +101,13 @@ struct ipchange_message {
 struct ipchange_event {
   event_t event;
   ipchange_callback_t callback;
+#if _WIN32
   HANDLE address_handle; /**< NotifyUnicastIpAddressChange handle */
   HANDLE interface_handle; /**< NotifyIpInterfaceChange handle */
   socket_t pipefds[2];
+#elif __APPLE__
+  socket_t socketfd;
+#endif
 };
 
 int create_ipchange_event(ipchange_event_t *, ipchange_callback_t, uint32_t, void *);
@@ -131,13 +116,42 @@ typedef struct { uint32_t v; } atomic_uint32_t;
 
 inline uint32_t atomic_ld32(const volatile atomic_uint32_t *a) { return a->v; }
 inline void atomic_st32(volatile atomic_uint32_t *a, uint32_t v) { a->v = v; }
+#if _MSC_VER
+inline uint32_t atomic_inc32(volatile atomic_uint32_t *a) { return InterlockedIncrement(&a->v); }
+inline uint32_t atomic_dec32(volatile atomic_uint32_t *a) { return InterlockedDecrement(&a->v); }
+#else
+inline uint32_t atomic_inc32(volatile atomic_uint32_t *a) { return __sync_add_and_fetch(&a->v, 1); }
+inline uint32_t atomic_dec32(volatile atomic_uint32_t *a) { return __sync_sub_and_fetch(&a->v, 1); }
+#endif
 
-typedef struct loop loop_t;
 struct loop { /* size must be known for static allocation */
-  SOCKET pipefds[2];
+  socket_t pipefds[2]; /**< self-pipe used for triggering */
+#if _WIN32
   atomic_uint32_t shutdown; // FIXME: perhaps make this a tri-state?!
   //SRWLOCK lock; // FIXME: do we need a lock in case of epoll?!
   HANDLE epollfd;
+#elif __APPLE__
+  int kqueuefd;
+  atomic_uint32_t events;
+#endif
+};
+
+#define EVENTLIST_DELTA (8)
+
+/* eventlist must be treated as an opaque structure. by removing the context
+   from the loop structure, no additional locks are required to add or delete
+   events */
+typedef struct eventlist eventlist_t;
+struct eventlist {
+#if _WIN32
+  // implement
+#elif __APPLE__
+  union {
+    struct kevent fixed[EVENTLIST_DELTA];
+    struct kevent *dynamic;
+  } events;
+#endif
+  size_t length;
 };
 
 int create_loop(loop_t *);
@@ -145,4 +159,4 @@ void destroy_loop(loop_t *);
 int add_event(loop_t *, event_t *);
 int delete_event(loop_t *, event_t *);
 int notify(loop_t *);
-int run(loop_t *);
+int run(loop_t *, eventlist_t *);
