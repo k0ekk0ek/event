@@ -376,6 +376,9 @@ static int proxy_ipchange_event(loop_t *loop, ipchange_event_t *event)
 }
 
 #elif __FreeBSD__
+// https://www.freebsd.org/cgi/man.cgi?query=route&apropos=0&sektion=4&manpath=FreeBSD+1.1-RELEASE&arch=default&format=html
+// also see UNIX Network Programming volume 1 chapter 18
+
 /*
  * Round up 'a' to next multiple of 'size', which must be a power of 2
  */
