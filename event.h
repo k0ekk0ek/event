@@ -22,7 +22,7 @@
 #include <iphlpapi.h>
 
 typedef SOCKET socket_t;
-#elif __APPLE__
+#elif __APPLE__ || __FreeBSD__
 #include <sys/event.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
@@ -86,7 +86,9 @@ struct interface {
   NET_LUID luid;
   NET_IFINDEX index;
 #elif __APPLE__
-  uint32_t unit;
+  uint32_t unit; // FIXME: rename to index
+#elif __FreeBSD__
+  unsigned short index;
 #endif
 };
 
@@ -105,7 +107,7 @@ struct ipchange_event {
   HANDLE address_handle; /**< NotifyUnicastIpAddressChange handle */
   HANDLE interface_handle; /**< NotifyIpInterfaceChange handle */
   socket_t pipefds[2];
-#elif __APPLE__
+#else // __APPLE__ || __FreeBSD__ || __linux__
   socket_t socketfd;
 #endif
 };
@@ -130,7 +132,7 @@ struct loop { /* size must be known for static allocation */
   atomic_uint32_t shutdown; // FIXME: perhaps make this a tri-state?!
   //SRWLOCK lock; // FIXME: do we need a lock in case of epoll?!
   HANDLE epollfd;
-#elif __APPLE__
+#elif __APPLE__ || __FreeBSD__
   int kqueuefd;
   atomic_uint32_t events;
 #endif
@@ -145,7 +147,7 @@ typedef struct eventlist eventlist_t;
 struct eventlist {
 #if _WIN32
   // implement
-#elif __APPLE__
+#elif __APPLE__ || __FreeBSD__
   union {
     struct kevent fixed[EVENTLIST_DELTA];
     struct kevent *dynamic;

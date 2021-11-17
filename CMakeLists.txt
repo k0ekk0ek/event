@@ -5,7 +5,7 @@ set(sources main.c event.c)
 
 if(WIN32)
   list(APPEND sources compat/wepoll.c windows.c)
-elseif(APPLE)
+elseif(APPLE OR UNIX)
   list(APPEND sources darwin.c)
 endif()
 

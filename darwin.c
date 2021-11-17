@@ -34,20 +34,28 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#if __FreeBSD__
+#include <sys/param.h>
+#endif
 #include <net/route.h>
 #include <netinet/in.h>
 #include <assert.h>
 #include <errno.h>
 #include <unistd.h>
 #include <sys/event.h>
-#include <sys/kern_event.h>
 #include <arpa/inet.h>
 #include <sys/ioctl.h>
 #include <fcntl.h>
 
+#if __APPLE__
+#include <sys/kern_event.h>
 #include <netinet/in_var.h> // struct kev_in_data
 #include <netinet6/in6_var.h> // struct kev_in6_data
 #include <net/if_var.h> // struct net_event_data
+#elif __FreeBSD__
+#include <net/if.h>
+#include <net/if_var.h>
+#endif
 
 #include "event.h"
 
@@ -85,11 +93,11 @@ int create_ipchange_event(
   void *user_data)
 {
   int fd;
+
+  assert(event);
+
+#if __APPLE__
   struct kev_request req;
-
-  if (!event)
-    return -1;
-
   if ((fd = socket(PF_SYSTEM, SOCK_RAW, SYSPROTO_EVENT)) == -1)
     goto err_socket;
   req.vendor_code = KEV_VENDOR_APPLE;
@@ -97,6 +105,12 @@ int create_ipchange_event(
   req.kev_subclass = KEV_ANY_SUBCLASS;
   if (ioctl(fd, SIOCSKEVFILT, &req) == -1)
     goto err_ioctl;
+#elif __FreeBSD__
+  if ((fd = socket(AF_ROUTE, SOCK_RAW, AF_UNSPEC)) == -1)
+    goto err_socket;
+#else
+#error "Unsupported operating system"
+#endif
   memset(event, 0, sizeof(*event));
   event->socketfd = fd;
   event->callback = callback;
@@ -255,6 +269,7 @@ int notify(loop_t *loop)
   return write(loop->pipefds[1], buf, sizeof(buf)) == 1 ? 0 : -1;
 }
 
+#if __APPLE__
 static inline int inet_event(
   loop_t *loop,
   ipchange_event_t *event,
@@ -359,6 +374,81 @@ static int proxy_ipchange_event(loop_t *loop, ipchange_event_t *event)
 
   return 0;
 }
+
+#elif __FreeBSD__
+/*
+ * Round up 'a' to next multiple of 'size', which must be a power of 2
+ */
+#define ROUNDUP(a, size) (((a) & ((size)-1)) ? (1 + ((a) | ((size)-1))) : (a))
+
+/*
+ * Step to next socket address structure;
+ * if sa_len is 0, assume it is sizeof(u_long).
+ */
+#define NEXT_SA(ap) ap = (struct sockaddr *) \
+     ((caddr_t) ap + (ap->sa_len ? ROUNDUP(ap->sa_len, sizeof (u_long)) : \
+                                        sizeof(u_long)))
+
+static void get_rtaddrs(int addrs, const struct sockaddr *sa, const struct sockaddr **rti_info)
+{
+  for (int i = 0; i < RTAX_MAX; i++) {
+    if (addrs & (1 << i)) {
+      rti_info[i] = sa;
+      NEXT_SA(sa);
+    } else {
+      rti_info[i] = NULL;
+    }
+  }
+}
+
+static int proxy_ipchange_event(loop_t *loop, ipchange_event_t *event)
+{
+  unsigned char buf[512];
+  ssize_t msglen;
+
+  do {
+    msglen = read(event->socketfd, buf, sizeof(buf));
+    if (msglen == -1 && errno != EINTR)
+      return -1;
+  } while (msglen == -1);
+
+  const struct {
+    unsigned short rtm_msglen;
+    unsigned char rtm_version;
+    unsigned char rtm_type;
+  } *msghdr = (void *)buf;
+
+  assert((size_t)msghdr->rtm_msglen == (size_t)msglen);
+  switch (msghdr->rtm_type) {
+    case RTM_NEWADDR: /* address being added to iface */
+    case RTM_DELADDR: { /* address being remove from iface */
+      const struct ifa_msghdr *ifa_msghdr = (void *)buf;
+      const interface_t iface = { ifa_msghdr->ifam_index };
+      const struct sockaddr *saddr = NULL, *rti_info[RTAX_MAX];
+      ipchange_message_t msg = { &iface, NULL };
+      uint32_t flags = 0;
+      /* retrieve socket addresses */
+      saddr = (const struct sockaddr *)(ifa_msghdr + 1);
+      get_rtaddrs(ifa_msghdr->ifam_addrs, saddr, rti_info);
+      msg.socket_address = saddr = rti_info[RTAX_IFA];
+      if (saddr->sa_family == AF_INET)
+        flags = msghdr->rtm_type == RTM_NEWADDR ? IPV4_ADDED : IPV4_DELETED;
+      else
+        flags = msghdr->rtm_type == RTM_DELADDR ? IPV6_ADDED : IPV6_DELETED;
+      return event->callback(event, &msg, flags, event->event.user_data);
+    }
+    case RTM_IFINFO: { /* iface going up/down etc. */
+      const struct if_msghdr *if_msghdr = (void *)buf;
+      const interface_t iface = { if_msghdr->ifm_index };
+      ipchange_message_t msg = { &iface, NULL };
+      uint32_t flags = (if_msghdr->ifm_flags & IFF_UP) ? LINK_UP : LINK_DOWN;
+      return event->callback(event, &msg, flags, event->event.user_data);
+    }
+    default: /* discard unsupported messages */
+      return 0;
+  }
+}
+#endif
 
 int run(loop_t *loop, eventlist_t *list)
 {
