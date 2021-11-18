@@ -1,7 +1,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#if !_WIN32
 #include <sys/socket.h>
+#endif
 
 #include "event.h"
 

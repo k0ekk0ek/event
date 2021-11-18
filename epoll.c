@@ -59,59 +59,53 @@
 #include <stdbool.h>
 #include <stdio.h>
 
-#include "compat/wepoll.h"
+#if _WIN32
+//#include "compat/wepoll.h"
+//#include <Windows.h.>
+//#include <winsock2.h>
+//#include <ws2tcpip.h>
+//#include <ws2ipdef.h>
+//#include <iphlpapi.h>
+#else
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <sys/param.h>
+#include <sys/socket.h>
+#include <net/route.h>
+#include <netinet/in.h>
+#include <errno.h>
+#include <unistd.h>
+#include <arpa/inet.h>
+#include <asm/types.h>
+#include <linux/netlink.h>
+#include <linux/rtnetlink.h>
+#include <sys/epoll.h>
+#include <net/if.h>
+
+#define epoll_close(x) close(x)
+
+#endif
 
 #include "event.h"
-#include <Windows.h.>
-#include <winsock2.h>
-#include <ws2tcpip.h>
-#include <ws2ipdef.h>
-#include <iphlpapi.h>
 
-int
-create_socket_event(
-  socket_event_t *event,
-  socket_t socketfd,
-  socket_callback_t callback,
-  uint32_t flags,
-  void *user_data)
-{
-  assert(event);
-  assert(flags & (READ|WRITE));
-  assert(callback);
-
-  memset(event, 0, sizeof(*event));
-  event->event.source = SOCKET_EVENT;
-  event->event.flags = flags & (READ|WRITE);
-  event->event.user_data = user_data;
-  event->socketfd = socketfd;
-  event->callback = callback;
-  return 0;
-}
-
-static void
-destroy_socket_event(socket_event_t *event)
-{
-  memset(event, 0, sizeof(*event));
-}
-
-/* use same structure for every ipchange event for convenience */
+#if _WIN32
+// use same structure for every ipchange event for convenience
 struct ipchange {
   uint32_t event;
   NET_LUID luid;
   NET_IFINDEX index;
   ADDRESS_FAMILY family;
-  SOCKADDR_INET socket_address; /* zeroed out on NotifyIpInterfaceChange */
+  SOCKADDR_INET socket_address; // zeroed out on NotifyIpInterfaceChange
 };
 
 static inline int
-read_ipchange(const ipchange_event_t *event, struct ipchange *change)
+read_ipchange(SOCKET fd, struct ipchange *change)
 {
   int cnt, off = 0, len = sizeof(*change);
   uint8_t *buf = (uint8_t *)change;
 
   do {
-    cnt = recv(event->pipefds[0], buf + off, len - off, 0);
+    cnt = recv(fd, buf + off, len - off, 0);
     if (cnt == SOCKET_ERROR && WSAGetLastError() == WSAEINTR)
       continue;
     if (cnt == SOCKET_ERROR)
@@ -125,13 +119,13 @@ read_ipchange(const ipchange_event_t *event, struct ipchange *change)
 }
 
 static inline int
-write_ipchange(ipchange_event_t *event, const struct ipchange *change)
+write_ipchange(SOCKET fd, const struct ipchange *change)
 {
   int cnt, off = 0, len = sizeof(*change);
   uint8_t *buf = (void *)change;
 
   do {
-    cnt = send(event->pipefds[1], buf + (size_t)off, len, 0);
+    cnt = send(fd, buf + (size_t)off, len, 0);
     if (cnt == SOCKET_ERROR && WSAGetLastError() == WSAEINTR)
       continue;
     if (cnt == SOCKET_ERROR)
@@ -144,7 +138,7 @@ write_ipchange(ipchange_event_t *event, const struct ipchange *change)
   return 0;
 }
 
-/* registered as callback with NotifyUnicastIpAddressChange */
+// registered as callback with NotifyUnicastIpAddressChange
 static void
 do_address_change(
   void *caller_context,
@@ -156,7 +150,7 @@ do_address_change(
 
   assert(caller_context);
 
-  if (!row) /* initial notification, unused */
+  if (!row) // initial notification, unused
     return;
   assert(notification_type != MibInitialNotification);
   if (notification_type == MibParameterNotification)
@@ -172,10 +166,10 @@ do_address_change(
   change.family = row->Address.si_family;
   change.socket_address = row->Address;
 
-  write_ipchange(caller_context, &change);
+  write_ipchange((SOCKET)caller_context, &change);
 }
 
-/* registered as callback with NotifyIpInterfaceChange */
+// registered as callback with NotifyIpInterfaceChange
 static void
 do_interface_change(
   void *caller_context,
@@ -186,7 +180,7 @@ do_interface_change(
 
   assert(caller_context);
 
-  if (!row) /* initial notification, unused */
+  if (!row) // initial notification, unused
     return;
   assert(notification_type != MibInitialNotification);
   if (notification_type == MibParameterNotification)
@@ -199,44 +193,123 @@ do_interface_change(
   change.family = row->Family;
   memset(&change.socket_address, 0, sizeof(change.socket_address));
 
-  write_ipchange(caller_context, &change);
+  write_ipchange((SOCKET)caller_context, &change);
 }
 
-int32_t
-create_ipchange_event(
+// use a SOCK_DGRAM socket pair to deal with partial writes
+static int make_dgram_pipe(SOCKET pipefds[2])
+{
+  struct sockaddr_in addr;
+  socklen_t addrlen = sizeof(addr);
+  SOCKET fds[2] = { INVALID_SOCKET, INVALID_SOCKET };
+
+  addr.sin_family = AF_INET;
+  addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  addr.sin_port = 0;
+  if ((fds[0] = socket(AF_INET, SOCK_DGRAM, 0)) == INVALID_SOCKET)
+    goto err_socket_fd0;
+  if (bind(fds[0], (struct sockaddr *)&addr, addrlen) == SOCKET_ERROR)
+    goto err_bind;
+  if (getsockname(fds[0], (struct sockaddr *)&addr, &addrlen) == SOCKET_ERROR)
+    goto err_bind;
+  if ((fds[1] = socket(AF_INET, SOCK_DGRAM, 0)) == INVALID_SOCKET)
+    goto err_socket_fd1;
+  if (connect(fds[1], (struct sockaddr *)&addr, addrlen) == -1)
+    goto err_connect;
+  // equivalent to FD_CLOEXEC
+  SetHandleInformation((HANDLE) fds[0], HANDLE_FLAG_INHERIT, 0);
+  SetHandleInformation((HANDLE) fds[1], HANDLE_FLAG_INHERIT, 0);
+  pipefds[0] = fds[0];
+  pipefds[1] = fds[1];
+  return 0;
+err_connect:
+  closesocket(fds[1]);
+err_socket_fd1:
+err_bind:
+  closesocket(fds[0]);
+err_socket_fd0:
+  return -1;
+}
+
+static void close_pipe(socket_t pipefd[2])
+{
+  closesocket(pipefd[0]);
+  closesocket(pipefd[1]);
+}
+
+int create_ipchange_event(
   ipchange_event_t *event,
   ipchange_callback_t callback,
   uint32_t flags,
   void *user_data)
 {
-  if (!event)
-    return -1;
+  SOCKET fds[2];
+  HANDLE addr_hdl = NULL, iface_hdl = NULL;
 
-  /* callbacks registered when added because self-pipe is required */
+  assert(event);
+
+  // make self-pipe required by callbacks
+  if (make_dgram_pipe(fds) == -1)
+    goto err_pipe;
+
+  // register callbacks that send a notifications over the self-pipe
+  if (flags & (LINK_UP|LINK_DOWN)) {
+    if (NO_ERROR != NotifyIpInterfaceChange(
+      AF_UNSPEC, &do_interface_change, (void*)fds[1], false, &iface_hdl))
+      goto err_iface;
+  }
+
+  if (flags & (IPV4_ADDED|IPV4_DELETED|IPV6_ADDED|IPV6_DELETED)) {
+    bool ip4 = (flags & (IPV4_ADDED|IPV4_DELETED)) != 0;
+    bool ip6 = (flags & (IPV6_ADDED|IPV6_DELETED)) != 0;
+    ADDRESS_FAMILY af = (ip4 && ip6) ? AF_UNSPEC : (ip6 ? AF_INET6 : AF_INET);
+    if (NO_ERROR != NotifyUnicastIpAddressChange(
+      af, &do_address_change, (void*)fds[1], false, &addr_hdl))
+      goto err_addr;
+  }
+
   memset(event, 0, sizeof(*event));
+  event->pipefds[0] = fds[0];
+  event->pipefds[1] = fds[1];
+  event->address_handle = addr_hdl;
+  event->interface_handle = iface_hdl;
   event->callback = callback;
   event->event.source = IPCHANGE_EVENT;
   event->event.flags = flags;
   event->event.user_data = user_data;
   return 0;
+err_addr:
+  CancelMibChangeNotify2(addr_hdl);
+err_iface:
+  close_pipe(fds);
+err_pipe:
+  return -1;
 }
 
-static void
-destroy_ipchange_event(ipchange_event_t *event)
+static void destroy_ipchange_event(ipchange_event_t *event)
 {
   if (!event)
     return;
+  // cancel notifications
+  if (event->address_handle)
+    CancelMibChangeNotify2(event->address_handle);
+  event->address_handle = NULL;
+  if (event->interface_handle)
+    CancelMibChangeNotify2(event->interface_handle);
+  event->interface_handle = NULL;
+  close_pipe(event->pipefds);
+  event->pipefds[0] = INVALID_SOCKET;
+  event->pipefds[1] = INVALID_SOCKET;
 }
 
 static int
-forward_ipchange_event(loop_t *loop, const ipchange_event_t *event)
+proxy_ipchange_event(loop_t *loop, const ipchange_event_t *event)
 {
   struct ipchange change;
 
-  if (read_ipchange(event, &change) != 0)
-    abort(); /* never happens, presumably */
+  if (read_ipchange(event->pipefds[0], &change) != 0)
+    abort(); // never happens, presumably
 
-  int ret;
   struct interface nic;
   struct ipchange_message msg = { &nic, NULL };
 
@@ -250,6 +323,146 @@ forward_ipchange_event(loop_t *loop, const ipchange_event_t *event)
     return event->callback(event, &msg, change.event, event->event.user_data);
   }
 }
+
+static SOCKET filedesc(ipchange_event_t *event)
+{
+  return event->pipefds[0];
+}
+#elif __linux__
+// https://stackoverflow.com/questions/36347807/how-to-monitor-ip-address-change-using-rtnetlink-socket-in-go-language
+// https://www.cs.cmu.edu/~srini/15-441/F01.full/www/assignments/P2/htmlsim_split/node20.html
+// https://www.masterraghu.com/subjects/np/introduction/unix_network_programming_v1.3/ch18lev1sec3.html
+// https://www.masterraghu.com/subjects/np/introduction/unix_network_programming_v1.3/ch18.html
+
+int create_ipchange_event(
+  ipchange_event_t *event,
+  ipchange_callback_t callback,
+  uint32_t flags,
+  void *user_data)
+{
+  int fd = -1;
+  struct sockaddr_nl sa;
+
+  assert(event);
+
+  if ((fd = socket(PF_NETLINK, SOCK_RAW, NETLINK_ROUTE)) == -1)
+    goto err_socket;
+  memset(&sa, 0, sizeof(sa));
+  sa.nl_family = AF_NETLINK;
+  if (flags & (LINK_UP|LINK_DOWN))
+    sa.nl_groups |= RTMGRP_LINK;
+  if (flags & (IPV4_ADDED|IPV4_DELETED))
+    sa.nl_groups |= RTMGRP_IPV4_IFADDR;
+  if (flags & (IPV6_ADDED|IPV6_DELETED))
+    sa.nl_groups |= RTMGRP_IPV6_IFADDR;
+  if (bind(fd, (struct sockaddr *)&sa, sizeof(sa)) == -1)
+    goto err_bind;
+  memset(event, 0, sizeof(*event));
+  event->socketfd = fd;
+  event->callback = callback;
+  event->event.source = IPCHANGE_EVENT;
+  event->event.flags = flags;
+  event->event.user_data = user_data;
+  return 0;
+err_bind:
+  close(fd);
+err_socket:
+  return -1;
+}
+
+static void destroy_ipchange_event(ipchange_event_t *event)
+{
+  if (!event)
+    return;
+  close(event->socketfd);
+}
+
+// inspired by get_rtaddrs and parse_rtaddrs
+static void
+get_rtattrs(
+  const struct rtattr *attrs,
+  unsigned int len,
+  const struct rtattr *rta_info[],
+  unsigned int max)
+{
+  memset(rta_info, 0, sizeof(*attrs) * max);
+  for (const struct rtattr *attr = attrs; RTA_OK(attr, len); attr = RTA_NEXT(attr, len)) {
+    assert(attr->rta_type <= max);
+    rta_info[attr->rta_type] = attr;
+  }
+}
+
+static int
+proxy_ipchange_event(loop_t *loop, const ipchange_event_t *event)
+{
+  int len, ret = 0;
+  struct nlmsghdr buf[8192/sizeof(struct nlmsghdr)];
+  struct iovec iov = { buf, sizeof(buf) };
+  struct sockaddr_nl sa;
+  struct msghdr msg = { &sa, sizeof(sa), &iov, 1, NULL, 0, 0 };
+  len = recvmsg(event->socketfd, &msg, 0);
+
+  for (struct nlmsghdr *nh = buf; ret == 0 && NLMSG_OK(nh, len); nh = NLMSG_NEXT(nh, len)) {
+    // end of multipart message
+    if (nh->nlmsg_type == NLMSG_DONE)
+      break;
+
+    struct ifinfomsg *ifimsg = NLMSG_DATA(nh);
+
+    switch (nh->nlmsg_type) {
+      case RTM_NEWADDR:
+      case RTM_DELADDR: {
+        interface_t nic = { ifimsg->ifi_index };
+        uint32_t flags = 0u;
+        struct ifaddrmsg *ifamsg = NLMSG_DATA(nh);
+        struct rtattr *rta_info[IFA_MAX + 1];
+        get_rtattrs(IFA_RTA(ifamsg), nh->nlmsg_len - NLMSG_LENGTH(sizeof(*ifamsg)), rta_info, IFA_MAX);
+        struct sockaddr_storage saddr;
+        void *rta_data = RTA_DATA(rta_info[IFA_ADDRESS]);
+        if (ifamsg->ifa_family == AF_INET) {
+          struct sockaddr_in *saddr_in = (struct sockaddr_in *)&saddr;
+          flags = (nh->nlmsg_type == RTM_NEWADDR) ? IPV4_ADDED : IPV4_DELETED;
+          saddr_in->sin_family = AF_INET;
+          saddr_in->sin_port = 0;
+          memcpy(&saddr_in->sin_addr, rta_data, sizeof(saddr_in->sin_addr));
+        } else {
+          struct sockaddr_in6 *saddr_in6 = (struct sockaddr_in6 *)&saddr;
+          flags = (nh->nlmsg_type == RTM_NEWADDR) ? IPV6_ADDED : IPV6_DELETED;
+          saddr_in6->sin6_family = AF_INET6;
+          saddr_in6->sin6_port = 0;
+          memcpy(&saddr_in6->sin6_addr, rta_data, sizeof(saddr_in6->sin6_addr));
+        }
+
+        ipchange_message_t msg = { &nic, &saddr };
+        ret = event->callback(event, &msg, flags, event->event.user_data);
+      } break;
+      case RTM_NEWLINK:
+      case RTM_DELLINK: {
+        interface_t nic = { ifimsg->ifi_index };
+        uint32_t flags = (ifimsg->ifi_flags & IFF_UP) ? LINK_UP : LINK_DOWN;
+
+        ipchange_message_t msg = { &nic, NULL };
+        ret = event->callback(event, &msg, flags, event->event.user_data);
+      } break;
+      default:
+        break;
+    }
+  }
+
+  return ret;
+}
+
+static int filedesc(ipchange_event_t *event)
+{
+  return event->socketfd;
+}
+
+static void close_pipe(int pipefds[2])
+{
+  close(pipefds[0]);
+  close(pipefds[1]);
+}
+#endif
 
 void destroy_event(void *event)
 {
@@ -267,6 +480,7 @@ void destroy_event(void *event)
   }
 }
 
+#if _WIN32
 static int make_pipe(socket_t pipefd[2])
 {
   struct sockaddr_in addr;
@@ -302,78 +516,30 @@ fail:
   closesocket (s2);
   return -1;
 }
-
-static void close_pipe(socket_t pipefd[2])
+#elif __linux__
+static int make_pipe(socket_t pipefds[2])
 {
-  closesocket(pipefd[0]);
-  closesocket(pipefd[1]);
+  return pipe(pipefds);
 }
+#endif
 
 static inline int
 add_ipchange_event(loop_t *loop, ipchange_event_t *event)
 {
-  socket_t fds[2];
   struct epoll_event ev = { .events = EPOLLIN, { .ptr = event } };
-  HANDLE addr_hdl = NULL, iface_hdl = NULL;
 
-  /* loop must be locked */
-
-  assert(!event->address_handle);
-  assert(!event->interface_handle);
-
-  /* register callbacks that send a notification over a self-pipe */
-  if (event->event.flags & (LINK_UP|LINK_DOWN)) {
-    if (NO_ERROR != NotifyIpInterfaceChange(
-      AF_UNSPEC, &do_interface_change, event, false, &iface_hdl))
-      goto err_iface;
-  }
-
-  if (event->event.flags & (IPV4_ADDED|IPV4_DELETED|IPV6_ADDED|IPV6_DELETED)) {
-    bool ip4 = (event->event.flags & (IPV4_ADDED|IPV4_DELETED)) != 0;
-    bool ip6 = (event->event.flags & (IPV6_ADDED|IPV6_DELETED)) != 0;
-    ADDRESS_FAMILY af = (ip4 && ip6) ? AF_UNSPEC : (ip6 ? AF_INET6 : AF_INET);
-    if (NO_ERROR != NotifyUnicastIpAddressChange(
-      af, &do_address_change, event, false, &addr_hdl))
-      goto err_addr;
-  }
-
-  if (make_pipe(fds) == -1)
-    goto err_pipe;
-  if (epoll_ctl(loop->epollfd, EPOLL_CTL_ADD, fds[0], &ev) == -1)
-    goto err_epoll;
-
-  event->pipefds[0] = fds[0];
-  event->pipefds[1] = fds[1];
-  event->address_handle = addr_hdl;
-  event->interface_handle = iface_hdl;
+  assert(loop);
+  assert(event);
+  if (epoll_ctl(loop->epollfd, EPOLL_CTL_ADD, filedesc(event), &ev) == -1)
+    return -1;
   event->event.loop = loop;
   return 0;
-err_epoll:
-  close_pipe(fds);
-err_pipe:
-  if (addr_hdl)
-    CancelMibChangeNotify2(addr_hdl);
-err_addr:
-  if (iface_hdl)
-    CancelMibChangeNotify2(iface_hdl);
-err_iface:
-  return -1;
 }
 
 static inline int
 delete_ipchange_event(loop_t *loop, ipchange_event_t *event)
 {
-  /* cancel notifications */
-  if (event->address_handle)
-    CancelMibChangeNotify2(event->address_handle);
-  event->address_handle = NULL;
-  if (event->interface_handle)
-    CancelMibChangeNotify2(event->interface_handle);
-  event->interface_handle = NULL;
-  epoll_ctl(loop->epollfd, EPOLL_CTL_DEL, event->pipefds[0], NULL);
-  close_pipe(event->pipefds);
-  event->pipefds[0] = INVALID_SOCKET;
-  event->pipefds[1] = INVALID_SOCKET;
+  epoll_ctl(loop->epollfd, EPOLL_CTL_DEL, filedesc(event), NULL);
   event->event.loop = NULL;
   return 0;
 }
@@ -407,9 +573,6 @@ int add_event(loop_t *loop, event_t *event)
   if (event->loop)
     return event->loop == loop ? 0 : -1;
 
-  //lock(loop);
-  assert(loop->epollfd != NULL);
-
   switch (event->source) {
     case IPCHANGE_EVENT:
       ret = add_ipchange_event(loop, (ipchange_event_t *)event);
@@ -420,8 +583,7 @@ int add_event(loop_t *loop, event_t *event)
       break;
   }
 
-  //unlock(loop);
-
+  atomic_inc32(&loop->events);
   return ret;
 }
 
@@ -435,9 +597,6 @@ int delete_event(loop_t *loop, event_t *event)
   if (event->loop != loop)
     return -1;
 
-  //lock(loop);
-  assert(loop->epollfd != NULL);
-
   switch (event->source) {
     case IPCHANGE_EVENT:
       delete_ipchange_event(loop, (ipchange_event_t *)event);
@@ -448,15 +607,14 @@ int delete_event(loop_t *loop, event_t *event)
       break;
   }
 
-  //unlock(loop);
-
+  atomic_dec32(&loop->events);
   return ret;
 }
 
 int create_loop(loop_t *loop)
 {
-  SOCKET pipefds[2];
-  HANDLE epollfd = NULL;
+  socket_t pipefds[2];
+  socket_t epollfd;
   struct epoll_event ev;
 
   assert(loop);
@@ -474,7 +632,6 @@ int create_loop(loop_t *loop)
   loop->pipefds[0] = pipefds[0];
   loop->pipefds[1] = pipefds[1];
   loop->epollfd = epollfd;
-  //InitializeSRWLock(&loop->lock);
   return 0;
 err_epoll_ctl:
   epoll_close(epollfd);
@@ -489,11 +646,7 @@ void destroy_loop(loop_t *loop)
   if (!loop)
     return;
   close_pipe(loop->pipefds);
-  loop->pipefds[0] = INVALID_SOCKET;
-  loop->pipefds[1] = INVALID_SOCKET;
   epoll_close(loop->epollfd);
-  loop->epollfd = NULL;
-  //memset(&loop->lock, 0, sizeof(loop->lock));
 }
 
 int notify(loop_t *loop)
@@ -503,44 +656,63 @@ int notify(loop_t *loop)
   return send(loop->pipefds[1], buf, sizeof(buf), 0) == 1 ? 0 : -1;
 }
 
-#define MAX_EVENTS (10)
-int run(loop_t *loop)
+int run(loop_t *loop, eventlist_t *list)
 {
-  int cnt, err = 0;
-  struct epoll_event events[MAX_EVENTS];
+  int ret = 0;
+  uint32_t blk = sizeof(list->events.fixed) / sizeof(list->events.fixed[0]);
+  uint32_t cnt = atomic_ld32(&loop->events), len = 0;
+  struct epoll_event *evs = NULL;
 
-  for (; !err && !atomic_ld32(&loop->shutdown);) {
-    int ready = epoll_wait(loop->epollfd, events, MAX_EVENTS, -1);
+  if (list->length <= blk) /* eventlist has a fixed number of minimum slots */
+    list->length = blk;
+
+  if (cnt <= list->length) {
+    len = list->length;
+    evs = list->length <= blk ? list->events.fixed : list->events.dynamic;
+  } else {
+    len = (list->length / blk) + 1;
+    if (!(evs = malloc(blk * sizeof(*list->events.dynamic))))
+      return -1;
+    if (list->length > blk)
+      free(list->events.dynamic);
+    list->events.dynamic = evs;
+    list->length = len;
+  }
+
+  assert(evs);
+
+  for (; ret == 0;) {
+    int ready = epoll_wait(loop->epollfd, evs, list->length, -1);
     if (ready == -1) {
       return cnt; // error...
     }
     for (int i=0; i < ready; i++) {
-      if (events[i].data.ptr == (void*)loop) {
+      if (evs[i].data.ptr == (void*)loop) {
         char buf[1];
         cnt = recv(loop->pipefds[0], buf, sizeof(buf), 0);
         assert(cnt == 1);
         // level-triggered, so pending event will show up again
         break;
       } else {
-        event_t *event = events[i].data.ptr;
+        event_t *event = evs[i].data.ptr;
         switch (event->source) {
           case IPCHANGE_EVENT:
-            err = forward_ipchange_event(loop, (ipchange_event_t *)event);
+            ret = proxy_ipchange_event(loop, (ipchange_event_t *)event);
             break;
           default: {
             uint32_t flags = 0;
             assert(event->source == SOCKET_EVENT);
-            if (events[i].events & EPOLLIN)
+            if (evs[i].events & EPOLLIN)
               flags |= READ;
-            if (events[i].events & EPOLLOUT)
+            if (evs[i].events & EPOLLOUT)
               flags |= WRITE;
             socket_event_t *socket_event = (socket_event_t *)event;
-            err = socket_event->callback(socket_event, flags, event->user_data);
+            ret = socket_event->callback(socket_event, flags, event->user_data);
           } break;
         }
       }
     }
   }
 
-  return err;
+  return ret;
 }

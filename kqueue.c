@@ -59,33 +59,6 @@
 
 #include "event.h"
 
-int create_socket_event(
-  socket_event_t *event,
-  socket_t socket,
-  socket_callback_t callback,
-  uint32_t flags,
-  void *user_data)
-{
-  assert(event);
-  assert(flags & (READ|WRITE));
-  assert(callback);
-
-  memset(event, 0, sizeof(*event));
-  event->event.source = SOCKET_EVENT;
-  event->event.flags = flags & (READ|WRITE);
-  event->event.user_data = user_data;
-  event->socketfd = socket;
-  event->callback = callback;
-  return 0;
-}
-
-static void
-destroy_socket_event(socket_event_t *event)
-{
-  memset(event, 0, sizeof(*event));
-  event->socketfd = -1;
-}
-
 int create_ipchange_event(
   ipchange_event_t *event,
   ipchange_callback_t callback,

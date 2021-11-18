@@ -16,14 +16,19 @@
 #define WIN32_LEAN_AND_MEAN
 #endif
 
+#include "compat/wepoll.h"
 #include <windows.h>
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <iphlpapi.h>
 
 typedef SOCKET socket_t;
-#elif __APPLE__ || __FreeBSD__
+#else
+# if __APPLE__ || __FreeBSD__
 #include <sys/event.h>
+# elif __linux__
+#include <sys/epoll.h>
+# endif
 #include <netinet/in.h>
 #include <arpa/inet.h>
 
@@ -67,6 +72,7 @@ struct socket_event {
 };
 
 int create_socket_event(socket_event_t *, socket_t, socket_callback_t, uint32_t, void *);
+void destroy_socket_event(socket_event_t *);
 
 typedef struct ipchange_message ipchange_message_t;
 struct ipchange_message;
@@ -89,6 +95,8 @@ struct interface {
   uint32_t unit; // FIXME: rename to index
 #elif __FreeBSD__
   unsigned short index;
+#elif __linux__
+  unsigned int index;
 #endif
 };
 
@@ -128,14 +136,14 @@ inline uint32_t atomic_dec32(volatile atomic_uint32_t *a) { return __sync_sub_an
 
 struct loop { /* size must be known for static allocation */
   socket_t pipefds[2]; /**< self-pipe used for triggering */
-#if _WIN32
+#if _WIN32 || __linux__
   atomic_uint32_t shutdown; // FIXME: perhaps make this a tri-state?!
   //SRWLOCK lock; // FIXME: do we need a lock in case of epoll?!
-  HANDLE epollfd;
+  socket_t epollfd;
 #elif __APPLE__ || __FreeBSD__
   int kqueuefd;
-  atomic_uint32_t events;
 #endif
+  atomic_uint32_t events;
 };
 
 #define EVENTLIST_DELTA (8)
@@ -145,8 +153,12 @@ struct loop { /* size must be known for static allocation */
    events */
 typedef struct eventlist eventlist_t;
 struct eventlist {
-#if _WIN32
-  // implement
+#if _WIN32 || __linux__ // << based on whether or not epoll is available
+	                //    .. in this case we simply know windows and linux use it
+  union {
+    struct epoll_event fixed[EVENTLIST_DELTA];
+    struct epoll_event *dynamic;
+  } events;
 #elif __APPLE__ || __FreeBSD__
   union {
     struct kevent fixed[EVENTLIST_DELTA];
